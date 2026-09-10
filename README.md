@@ -1,8 +1,9 @@
 # gt-dumper — gtmapper
 
 Growtopia (x64) offset mapper. Point it at a **dumped** `Growtopia.exe` and it regenerates
-`offsets.h` and `offsets.cs` for that build: 109 named function RVAs plus every Lua / RmlUi
-binding table, with nothing to maintain by hand between game updates.
+`offsets.h` and `offsets.cs` for that build: 129 function RVAs, 10 struct offsets derived from
+the code (`App::m_client`, `GameLogicComponent::m_localPlayer`, `sizeof(ItemInfo)`, ...) and every
+Lua / RmlUi binding table, with nothing to maintain by hand between game updates.
 
 **Contact:** Discord `.selahattingt`
 
@@ -17,9 +18,15 @@ update, no manual work unless the game itself changes a string.
 ## Features
 
 - Single C++17 source file, no dependencies, builds with MSVC in a second.
-- 109 offsets: `SendPacket`, `SendPacketRaw`, `ProcessTankUpdatePacket`,
-  `VariantList::SerializeFromMem`, `GetApp` / `GetClient` / `GetPacketProcessor` /
-  `GetLocalAvatar`, packet / world / tile / inventory / dialog / UI / pet handlers and more.
+- 129 function offsets: `SendPacket`, `SendPacketRaw`, `ProcessTankUpdatePacket`,
+  `VariantList::SerializeFromMem`, `App::Update`, `LogMsg`, `LogToConsole`, `GetApp` /
+  `GetClient` / `GetGameLogic` / `GetLocalAvatar` / `GetEntityRoot` / `GetItemInfoManager`,
+  `CreateTextLabelEntity`, `Entity::GetEntityByName`, packet / world / tile / inventory /
+  dialog / UI / pet handlers and more.
+- 10 struct offsets read off the code instead of guessed: `App::m_client`, `m_gameLogic`,
+  `m_itemInfoManager`, `m_entityRoot`, `m_trackHandler`, `GameLogicComponent::m_localPlayer`,
+  `m_world`, `World::m_tileMap`, `ENetClient::m_peer`, `sizeof(ItemInfo)`.
+- `kBuildTimestamp`: the PE timestamp of the build, so a DLL can refuse a stale offsets file.
 - All `luaL_Reg`-style binding tables (Lua 5.4 standard libraries and the RmlUi Lua API) with
   the RVA of every bound C function.
 - Derived struct offsets in the output comments (`App::client`, `App::packetProcessor`,
@@ -104,7 +111,8 @@ public static class Offsets {
 }
 ```
 
-All values are RVAs (add the module base at runtime).
+All `k*` values are RVAs (add the module base at runtime) except the `*Offset` / `ItemInfoSize`
+constants, which are struct offsets, and `kBuildTimestamp`.
 
 ## How it works
 
@@ -135,6 +143,15 @@ SPECIAL("GetApp", "", K_GETAPP),
   function must / must not reference.
 - `CALLEE(name, comment, parent, anchor)` — the function called by `parent` that references
   `anchor`.
+- `CALLAFTER(name, comment, anchor, exact, V(), V())` — the first call after the LEA of `anchor`
+  (how `LogMsg` and `LogToConsole` are found).
+- `PATTERN(name, comment, "48 8B ? ?", isFunctionStart, pick)` — classic byte signature, kept as a
+  fallback for string-less functions.
+- `LARGEST` / `NTHCALL` / `ALIAS` — largest callee, n-th call, or another name for a result.
+- `VTABLE(name, comment, ctorRecipe, slot, validatorRecipe, validatorSlot)` — a virtual function
+  taken from the vtable the constructor stores, verified against a known slot (`App::Update`).
+- `FIELD(name, comment, parent, mode, restrict)` — a struct offset derived from the instruction
+  after / before calls to `parent` (see `resolveField()`).
 - `SPECIAL(name, comment, kind)` — pattern based accessors (`GetApp` is the most-called
   `mov rax,[rip+x]; ret` leaf, the others are built on top of it) with their struct offsets
   derived from the code.
@@ -145,7 +162,7 @@ one-line change. Adding a new offset is one more line; output order is list orde
 
 ## Verification
 
-- 2026-09-09 build: 109 / 109 offsets and 39 binding tables. Cross-checked against an
+- 2026-09-09 build: 139 / 139 entries and 39 binding tables. Cross-checked against an
   independent capstone-based analysis with zero mismatches; the drift against the previous
   hand-made offsets file is locally constant with a single genuine linker reorder; the
   generated header compiles; repeated runs are byte-identical.

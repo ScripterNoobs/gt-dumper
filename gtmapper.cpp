@@ -229,6 +229,7 @@ public:
     std::unordered_map<uint32_t, uint32_t> callCountAny;                                  // any E8 target -> count
     std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> funcCalls;   // func -> (insn, target)
     std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, const std::string*>>> funcStrs;  // func -> (insn, str)
+    std::unordered_map<uint32_t, std::vector<std::pair<uint32_t, uint32_t>>> funcLeas;              // func -> (insn, target) all LEAs
     std::unordered_map<std::string, std::vector<uint32_t>> owners;                        // string -> funcs referencing it
     size_t leaCount = 0, callCount = 0;
 
@@ -271,6 +272,12 @@ public:
                 }
             }
         }
+        for (auto& kv : leaRefs)
+            for (uint32_t insn : kv.second) {
+                uint32_t f = ft.funcOf(insn);
+                if (f) funcLeas[f].push_back({insn, kv.first});
+            }
+        for (auto& kv : funcLeas) std::sort(kv.second.begin(), kv.second.end());
         for (auto& kv : leaRefs) {
             if (!img.inStrSec(kv.first)) continue;
             const std::string* s = strAt(kv.first);
@@ -351,7 +358,18 @@ public:
 };
 
 // ---------------------------------------------------------------- recipes
-enum Kind { K_STR, K_CALLEE, K_GETAPP, K_GETCLIENT, K_GETPP, K_GETLA };
+enum Kind {
+    K_STR, K_CALLEE, K_GETAPP, K_GETCLIENT, K_GETPP, K_GETLA,
+    K_PATTERN,        // byte signature; exact=true: match is the function start, exact=false: match is `E8 rel32`, resolve it
+    K_CALLAFTER,      // first call after the LEA of the anchor string inside its owner function
+    K_LARGEST,        // largest callee (by size) of `parent`
+    K_NTHCALL,        // arg-th call target (address order) inside `parent`
+    K_ALIAS,          // same address as `parent`
+    K_GETAPP_LAZY,    // the lazy-init GetApp variant (allocates App on first use)
+    K_GETAPP_TAILACC, // `sub rsp,28; call GetApp; mov rcx,rax; add rsp,28; jmp helper` accessor, most called
+    K_VTABLE,         // vtable found in `parent` (a constructor); result = slot `arg`; validated by needle-recipe at slot `arg2`
+    K_FIELD           // derive a struct offset, see resolveField() (mode = arg, needle = restricting recipe)
+};
 enum Pick { P_UNIQUE, P_LOWEST, P_HIGHEST, P_SMALLEST, P_LARGEST };
 
 struct Recipe {
@@ -364,6 +382,8 @@ struct Recipe {
     std::vector<const char*> also;      // function must also reference all of these
     std::vector<const char*> notalso;   // ... and none of these
     const char* parent;                 // K_CALLEE: name of the recipe whose callees are searched
+    int arg;                            // K_VTABLE slot / K_NTHCALL index / K_FIELD mode
+    int arg2;                           // K_VTABLE validator slot
 };
 
 #include "recipes.inl"
@@ -544,6 +564,283 @@ struct Resolver {
         return res;
     }
 
+    std::vector<uint32_t> pickAll(const Recipe& r, std::vector<uint32_t> f, Result& res) {
+        std::sort(f.begin(), f.end());
+        f.erase(std::unique(f.begin(), f.end()), f.end());
+        res.cands = f;
+        if (f.empty()) return f;
+        switch (r.pick) {
+        case P_UNIQUE: if (f.size() == 1) { res.rva = f[0]; res.ok = true; } else res.note = "ambiguous (" + std::to_string(f.size()) + " candidates)"; break;
+        case P_LOWEST: res.rva = f.front(); res.ok = true; break;
+        case P_HIGHEST: res.rva = f.back(); res.ok = true; break;
+        case P_SMALLEST: { uint32_t b = f[0]; for (uint32_t x : f) if (ft.sizeOf(x) < ft.sizeOf(b)) b = x; res.rva = b; res.ok = true; break; }
+        case P_LARGEST: { uint32_t b = f[0]; for (uint32_t x : f) if (ft.sizeOf(x) > ft.sizeOf(b)) b = x; res.rva = b; res.ok = true; break; }
+        }
+        return f;
+    }
+
+    // byte signature; candidates must be function starts (or leafs without unwind info)
+    Result resolvePattern(const Recipe& r) {
+        Result res;
+        std::vector<uint32_t> c;
+        for (uint32_t m : an.findPattern(r.needle)) {
+            uint32_t f = m;
+            if (!r.exact) {
+                const uint8_t* p = img.ptr(m, 5);
+                if (!p || p[0] != 0xE8) continue;
+                f = m + 5 + rdi32(p + 1);
+            }
+            if (!img.inText(f)) continue;
+            if (!ft.isFunc(f) && ft.funcOf(f) != 0) continue;
+            c.push_back(f);
+        }
+        if (c.empty()) res.note = "signature not found";
+        pickAll(r, c, res);
+        return res;
+    }
+
+    // first call after the LEA of the anchor string
+    Result resolveCallAfter(const Recipe& r) {
+        Result res;
+        std::vector<uint32_t> c;
+        for (uint32_t f : an.ownersOf(r.needle, r.exact)) {
+            bool ok = true;
+            for (const char* a : r.also) if (!an.funcRefs(f, a)) { ok = false; break; }
+            for (const char* n : r.notalso) if (ok && an.funcRefs(f, n)) { ok = false; break; }
+            if (!ok) continue;
+            auto it = an.funcStrs.find(f);
+            if (it == an.funcStrs.end()) continue;
+            for (auto& e : it->second) {
+                bool hit = r.exact ? (*e.second == r.needle) : (e.second->find(r.needle) != std::string::npos);
+                if (!hit) continue;
+                const uint8_t* p = img.ptr(e.first + 7, 80);
+                if (!p) continue;
+                for (int k = 0; k < 75; k++) {
+                    if (p[k] != 0xE8) continue;
+                    uint32_t tgt = e.first + 7 + k + 5 + rdi32(p + k + 1);
+                    if (img.inText(tgt) && (ft.isFunc(tgt) || ft.funcOf(tgt) == 0)) { c.push_back(tgt); break; }
+                }
+                break;
+            }
+        }
+        if (c.empty()) res.note = "no call follows the anchor string";
+        pickAll(r, c, res);
+        return res;
+    }
+
+    Result resolveLargest(const Recipe& r) {
+        Result res;
+        uint32_t p = get(r.parent);
+        if (!p) { res.note = std::string("parent ") + r.parent + " unresolved"; return res; }
+        uint32_t best = 0;
+        auto it = an.funcCalls.find(p);
+        if (it != an.funcCalls.end())
+            for (auto& e : it->second) if (!best || ft.sizeOf(e.second) > ft.sizeOf(best)) best = e.second;
+        if (best) { res.rva = best; res.ok = true; res.cands.push_back(best); } else res.note = "parent has no callees";
+        return res;
+    }
+
+    Result resolveNthCall(const Recipe& r) {
+        Result res;
+        uint32_t p = get(r.parent);
+        if (!p) { res.note = std::string("parent ") + r.parent + " unresolved"; return res; }
+        auto it = an.funcCalls.find(p);
+        if (it == an.funcCalls.end() || (size_t)r.arg >= it->second.size()) { res.note = "parent has too few calls"; return res; }
+        res.rva = it->second[r.arg].second; res.ok = true; res.cands.push_back(res.rva);
+        return res;
+    }
+
+    Result resolveAlias(const Recipe& r) {
+        Result res;
+        uint32_t p = get(r.parent);
+        if (!p) { res.note = std::string("parent ") + r.parent + " unresolved"; return res; }
+        res.rva = p; res.ok = true;
+        return res;
+    }
+
+    uint32_t appGlobal() {
+        uint32_t ga = get("GetApp");
+        const uint8_t* p = ga ? img.ptr(ga, 8) : nullptr;
+        return p ? ga + 7 + rdi32(p + 3) : 0;
+    }
+
+    // small function starting with `mov rax,[rip+g_pApp]` that also calls something (operator new + ctor)
+    Result resolveGetAppLazy() {
+        Result res;
+        uint32_t g = appGlobal();
+        if (!g) { res.note = "GetApp unresolved"; return res; }
+        uint32_t best = 0, bestN = 0;
+        for (uint32_t m : an.findPattern("48 8B 05 ?? ?? ?? ??")) {
+            const uint8_t* p = img.ptr(m, 7);
+            if (!p || m + 7 + rdi32(p + 3) != g) continue;
+            uint32_t f = ft.funcOf(m);
+            if (!f || m - f > 8 || ft.sizeOf(f) > 96) continue;
+            auto it = an.funcCalls.find(f);
+            if (it == an.funcCalls.end() || it->second.empty()) continue;
+            res.cands.push_back(f);
+            uint32_t n = (uint32_t)an.callers(f).size();
+            if (n > bestN) { bestN = n; best = f; }
+        }
+        if (best) { res.rva = best; res.ok = true; res.note = "lazy-init variant of GetApp"; } else res.note = "no lazy GetApp found";
+        return res;
+    }
+
+    // `sub rsp,28; call GetApp; mov rcx,rax; add rsp,28; jmp helper`, helper = `mov rax,[rcx+disp32]; ret`
+    Result resolveGetAppTailAcc(const Recipe& r) {
+        Result res;
+        uint32_t ga = get("GetApp");
+        if (!ga) { res.note = "GetApp unresolved"; return res; }
+        uint32_t best = 0, bestN = 0; int32_t bestDisp = 0;
+        for (uint32_t m : an.findPattern("48 83 EC 28 E8 ?? ?? ?? ?? 48 8B C8 48 83 C4 28 E9 ?? ?? ?? ??")) {
+            const uint8_t* p = img.ptr(m, 21);
+            if (!p || m + 9 + rdi32(p + 5) != ga) continue;
+            uint32_t h = m + 21 + rdi32(p + 17);
+            const uint8_t* hb = img.ptr(h, 8);
+            if (!hb || hb[0] != 0x48 || hb[1] != 0x8B || hb[2] != 0x81 || hb[7] != 0xC3) continue;
+            res.cands.push_back(m);
+            uint32_t n = an.anyCalls(m);
+            if (n > bestN) { bestN = n; best = m; bestDisp = rdi32(hb + 3); }
+        }
+        if (best) {
+            res.rva = best; res.ok = true;
+            char b[96]; snprintf(b, sizeof b, "%s = 0x%X (derived)", r.needle && *r.needle ? r.needle : "offset", bestDisp);
+            res.note = b;
+        } else res.note = "no tail-call accessor on GetApp found";
+        return res;
+    }
+
+    // vtable = LEA target in the constructor `parent` that is a run of >= 4 .text pointers and whose slot arg2 == needle-recipe
+    Result resolveVtable(const Recipe& r) {
+        Result res;
+        uint32_t ctor = get(r.parent), validator = get(r.needle);
+        if (!ctor || !validator) { res.note = "ctor or validator recipe unresolved"; return res; }
+        auto it = an.funcLeas.find(ctor);
+        if (it == an.funcLeas.end()) { res.note = "ctor has no LEAs"; return res; }
+        for (auto& e : it->second) {
+            uint32_t vt = e.second;
+            if (!(vt >= img.rdata->va && vt < img.rdata->end())) continue;
+            std::vector<uint32_t> slots;
+            for (int k = 0; k < 64; k++) {
+                const uint8_t* p = img.ptr(vt + 8 * k, 8);
+                if (!p) break;
+                uint64_t q = rd64(p);
+                if (q < img.base || q - img.base >= img.sizeOfImage || !img.inText((uint32_t)(q - img.base))) break;
+                slots.push_back((uint32_t)(q - img.base));
+            }
+            if (slots.size() < 4 || (size_t)r.arg2 >= slots.size() || slots[r.arg2] != validator) continue;
+            if ((size_t)r.arg >= slots.size()) { res.note = "vtable too small"; return res; }
+            res.rva = slots[r.arg]; res.ok = true;
+            char b[64]; snprintf(b, sizeof b, "vtable 0x%X slot %d", vt, r.arg);
+            res.note = b;
+            return res;
+        }
+        res.note = "no vtable in ctor matches the validator slot";
+        return res;
+    }
+
+    // struct offset derivation
+    //   mode 0: after `call parent`, the most common `mov/lea r64,[rax+disp]` (needle: only sites inside that recipe's function)
+    //   mode 1: first `mov rax,[rax+disp32]` inside parent's body
+    //   mode 2: like 1 but also `mov rax,[rcx+disp32]`, following a tail `jmp` into a helper
+    //   mode 3: most common `lea rcx,[r64+disp32]` in the 24 bytes before calls to parent
+    //   mode 4: most common imm32 of `imul r64,r64,imm32` in the 24 bytes after calls to parent
+    //   mode 5: before calls to parent: `call GetApp; mov r64,[rax+disp32]` -> disp (the object passed as `this`)
+    //   mode 6: like mode 0 but only `mov rcx,[rax+disp32]` (the object passed as `this` right after the accessor)
+    //   mode 7: last `mov r8,[r64+disp32]` before calls to parent (3rd argument, e.g. the ENet peer)
+    Result resolveField(const Recipe& r) {
+        Result res;
+        uint32_t p = get(r.parent);
+        if (!p) { res.note = std::string("parent ") + r.parent + " unresolved"; return res; }
+        std::map<int32_t, int> hist;
+        auto add = [&](int32_t v) { hist[v]++; };
+        if (r.arg == 0) {
+            uint32_t only = (r.needle && *r.needle) ? get(r.needle) : 0;
+            if (r.needle && *r.needle && !only) { res.note = std::string("restricting recipe ") + r.needle + " unresolved"; return res; }
+            auto it = an.callRefs.find(p);
+            if (it != an.callRefs.end())
+                for (uint32_t site : it->second) {
+                    if (only && ft.funcOf(site) != only) continue;
+                    const uint8_t* b = img.ptr(site + 5, 7);
+                    if (!b) continue;
+                    if ((b[0] == 0x48 || b[0] == 0x4C) && (b[1] == 0x8B || b[1] == 0x8D)) {
+                        if ((b[2] & 0xC7) == 0x80) add(rdi32(b + 3));
+                        else if ((b[2] & 0xC7) == 0x40) add((int8_t)b[3]);
+                    }
+                }
+        } else if (r.arg == 1 || r.arg == 2) {
+            const uint8_t* b = img.ptr(p, 48);
+            if (!b) { res.note = "cannot read parent"; return res; }
+            bool found = false;
+            for (int k = 0; k + 7 <= 48 && !found; k++) {
+                if (b[k] == 0x48 && b[k + 1] == 0x8B && (b[k + 2] == 0x80 || (r.arg == 2 && b[k + 2] == 0x81))) { add(rdi32(b + k + 3)); found = true; }
+                if (r.arg == 2 && !found && (b[k] == 0xE9 || b[k] == 0xE8)) {   // tail jmp / call into a tiny getter
+                    uint32_t h = p + k + 5 + rdi32(b + k + 1);
+                    const uint8_t* hb = img.ptr(h, 8);
+                    if (hb && hb[0] == 0x48 && hb[1] == 0x8B && (hb[2] == 0x81 || hb[2] == 0x80) && hb[7] == 0xC3) { add(rdi32(hb + 3)); found = true; }
+                }
+                if (b[k] == 0xC3) break;
+            }
+        } else if (r.arg == 3) {
+            auto it = an.callRefs.find(p);
+            if (it != an.callRefs.end())
+                for (uint32_t site : it->second) {
+                    const uint8_t* b = img.ptr(site - 24, 24);
+                    if (!b) continue;
+                    for (int k = 0; k + 7 <= 24; k++)
+                        if ((b[k] == 0x48 || b[k] == 0x49) && b[k + 1] == 0x8D && (b[k + 2] & 0xF8) == 0x88 && (b[k + 2] & 7) != 4) { add(rdi32(b + k + 3)); break; }
+                }
+        } else if (r.arg == 4) {
+            auto it = an.callRefs.find(p);
+            if (it != an.callRefs.end())
+                for (uint32_t site : it->second) {
+                    const uint8_t* b = img.ptr(site + 5, 24);
+                    if (!b) continue;
+                    for (int k = 0; k + 7 <= 24; k++)
+                        if ((b[k] & 0xF8) == 0x48 && b[k + 1] == 0x69) { add(rdi32(b + k + 3)); break; }
+                }
+        } else if (r.arg == 5) {
+            uint32_t ga = get("GetApp");
+            auto it = an.callRefs.find(p);
+            if (ga && it != an.callRefs.end())
+                for (uint32_t site : it->second) {
+                    const int W = 64;
+                    const uint8_t* b = img.ptr(site - W, W);
+                    if (!b) continue;
+                    for (int k = W - 12; k >= 0; k--) {
+                        if (b[k] != 0xE8 || site - W + k + 5 + rdi32(b + k + 1) != ga) continue;
+                        const uint8_t* n = b + k + 5;
+                        if ((n[0] == 0x48 || n[0] == 0x4C) && n[1] == 0x8B && (n[2] & 0xC7) == 0x80) add(rdi32(n + 3));
+                        break;
+                    }
+                }
+        } else if (r.arg == 6) {   // mode 6: after `call parent`, only `mov rcx,[rax+disp32]`
+            auto it = an.callRefs.find(p);
+            if (it != an.callRefs.end())
+                for (uint32_t site : it->second) {
+                    const uint8_t* b = img.ptr(site + 5, 7);
+                    if (b && b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x88) add(rdi32(b + 3));
+                }
+        } else if (r.arg == 7) {   // mode 7: last `mov r8,[r64+disp32]` in the 32 bytes before calls to parent
+            auto it = an.callRefs.find(p);
+            if (it != an.callRefs.end())
+                for (uint32_t site : it->second) {
+                    const uint8_t* b = img.ptr(site - 32, 32);
+                    if (!b) continue;
+                    int last = -1;
+                    for (int k = 0; k + 7 <= 32; k++)
+                        if ((b[k] == 0x4C || b[k] == 0x4D) && b[k + 1] == 0x8B && (b[k + 2] & 0xF8) == 0x80 && (b[k + 2] & 7) != 4) last = k;
+                    if (last >= 0) add(rdi32(b + last + 3));
+                }
+        }
+        if (hist.empty()) { res.note = "no matching instruction shape"; return res; }
+        int32_t best = 0; int bestN = -1, total = 0;
+        for (auto& kv : hist) { total += kv.second; if (kv.second > bestN) { bestN = kv.second; best = kv.first; } }
+        res.rva = (uint32_t)best; res.ok = true;
+        char b[96]; snprintf(b, sizeof b, "derived offset, %d of %d sites agree", bestN, total);
+        res.note = b;
+        return res;
+    }
+
     void printLine(const char* name, const Result& res, const char* tag) {
         printf("  %-36s %s", name, res.ok ? hex(res.rva).c_str() : "--------");
         if (res.ok) printf("  size %6u  callers %3zu", ft.sizeOf(res.rva), an.callers(res.rva).size());
@@ -570,6 +867,15 @@ struct Resolver {
             case K_GETCLIENT: res = resolveGetClient(); break;
             case K_GETPP: res = resolveGetPP(); break;
             case K_GETLA: res = resolveGetLA(); break;
+            case K_PATTERN: res = resolvePattern(r); break;
+            case K_CALLAFTER: res = resolveCallAfter(r); break;
+            case K_LARGEST: res = resolveLargest(r); break;
+            case K_NTHCALL: res = resolveNthCall(r); break;
+            case K_ALIAS: res = resolveAlias(r); break;
+            case K_GETAPP_LAZY: res = resolveGetAppLazy(); break;
+            case K_GETAPP_TAILACC: res = resolveGetAppTailAcc(r); break;
+            case K_VTABLE: res = resolveVtable(r); break;
+            case K_FIELD: res = resolveField(r); break;
             }
             res.attempts = cur.attempts + 1;
             res.recipe = res.ok || cur.recipe == nullptr ? &r : cur.recipe;
@@ -664,6 +970,7 @@ bool writeHeader(const std::string& path, const Image& img, const Resolver& rs, 
     fprintf(f, "// Growtopia x64 offsets - generated %s\n", utcNow().c_str());
     fprintf(f, "// image base 0x%llX  build hash %s  (PE timestamp %s)\n", (unsigned long long)img.base, buildHash(img).c_str(), peTime(img.timestamp).c_str());
     fprintf(f, "#pragma once\n#include <cstdint>\nnamespace gt {\n");
+    fprintf(f, "    constexpr uint32_t kBuildTimestamp = 0x%08X; // PE TimeDateStamp of the build these offsets belong to\n", img.timestamp);
     for (const std::string& name : rs.order) {
         const Result& res = rs.results.at(name);
         fprintf(f, "    constexpr uintptr_t k%s = 0x%08X; // %s\n", name.c_str(), res.rva, commentFor(*res.recipe, res).c_str());
@@ -688,6 +995,7 @@ bool writeCs(const std::string& path, const Image& img, const Resolver& rs, cons
     fprintf(f, "// Growtopia x64 offsets - generated %s\n", utcNow().c_str());
     fprintf(f, "// image base 0x%llX  build hash %s  (PE timestamp %s)\n", (unsigned long long)img.base, buildHash(img).c_str(), peTime(img.timestamp).c_str());
     fprintf(f, "public static class Offsets {\n");
+    fprintf(f, "    public const UInt32 BuildTimestamp = 0x%08X; // PE TimeDateStamp of the build these offsets belong to\n", img.timestamp);
     for (const std::string& name : rs.order) {
         const Result& res = rs.results.at(name);
         fprintf(f, "    public const Int64 %s = 0x%X; // %s\n", name.c_str(), res.rva, commentFor(*res.recipe, res).c_str());

@@ -7,8 +7,17 @@
 //         pick        : P_UNIQUE (fail when ambiguous), P_LOWEST / P_HIGHEST (address),
 //                       P_SMALLEST / P_LARGEST (function size)
 //         also/notalso: further strings the function must / must not reference (V() = none)
-//   CALLEE(name, comment, parent, anchor) -> the function called by `parent` that references `anchor`
-//   SPECIAL(name, comment, kind)          -> pattern based accessors, see gtmapper.cpp
+//   CALLEE(name, comment, parent, anchor)  -> the function called by `parent` that references `anchor`
+//   CALLAFTER(name, comment, anchor, exact, V(also), V(notalso)) -> first call after the LEA of `anchor`
+//   PATTERN(name, comment, "48 8B ? ?", isFunctionStart, pick) -> classic byte signature
+//                          (isFunctionStart=false: the match is a `call rel32`, its target is taken)
+//   LARGEST(name, comment, parent)          -> largest callee of `parent`
+//   NTHCALL(name, comment, parent, n)       -> n-th call (address order, 0-based) inside `parent`
+//   ALIAS(name, comment, parent)            -> same address under another name
+//   VTABLE(name, comment, ctorRecipe, slot, validatorRecipe, validatorSlot)
+//                                           -> slot of the vtable stored by the constructor, checked against a known slot
+//   FIELD(name, comment, parent, mode, restrictRecipe) -> a struct offset derived from code, see resolveField()
+//   SPECIAL(name, comment, kind)            -> pattern based accessors, see gtmapper.cpp
 //
 // Several entries may share a name: they are fallbacks, tried in order until one resolves
 // (the first entry's comment is used when none does). Output order = first occurrence.
@@ -16,9 +25,17 @@
 // When a new build breaks a recipe, run with -v: the candidates are listed and a new
 // anchor / tie-break can be chosen from the strings the candidate functions reference.
 #define V(...) std::vector<const char*>{__VA_ARGS__}
-#define STR(name, comment, anchor, exact, pick, also, notalso) { name, comment, K_STR, anchor, exact, pick, also, notalso, nullptr }
-#define CALLEE(name, comment, parent, anchor) { name, comment, K_CALLEE, anchor, true, P_UNIQUE, V(), V(), parent }
-#define SPECIAL(name, comment, kind) { name, comment, kind, "", true, P_UNIQUE, V(), V(), nullptr }
+#define STR(name, comment, anchor, exact, pick, also, notalso) { name, comment, K_STR, anchor, exact, pick, also, notalso, nullptr, 0, 0 }
+#define CALLEE(name, comment, parent, anchor) { name, comment, K_CALLEE, anchor, true, P_UNIQUE, V(), V(), parent, 0, 0 }
+#define CALLAFTER(name, comment, anchor, exact, also, notalso) { name, comment, K_CALLAFTER, anchor, exact, P_UNIQUE, also, notalso, nullptr, 0, 0 }
+#define PATTERN(name, comment, sig, isFuncStart, pick) { name, comment, K_PATTERN, sig, isFuncStart, pick, V(), V(), nullptr, 0, 0 }
+#define LARGEST(name, comment, parent) { name, comment, K_LARGEST, "", true, P_UNIQUE, V(), V(), parent, 0, 0 }
+#define NTHCALL(name, comment, parent, n) { name, comment, K_NTHCALL, "", true, P_UNIQUE, V(), V(), parent, n, 0 }
+#define ALIAS(name, comment, parent) { name, comment, K_ALIAS, "", true, P_UNIQUE, V(), V(), parent, 0, 0 }
+#define TAILACC(name, comment, offsetName) { name, comment, K_GETAPP_TAILACC, offsetName, true, P_UNIQUE, V(), V(), nullptr, 0, 0 }
+#define VTABLE(name, comment, ctor, slot, validator, vslot) { name, comment, K_VTABLE, validator, true, P_UNIQUE, V(), V(), ctor, slot, vslot }
+#define FIELD(name, comment, parent, mode, restrict) { name, comment, K_FIELD, restrict, true, P_UNIQUE, V(), V(), parent, mode, 0 }
+#define SPECIAL(name, comment, kind) { name, comment, kind, "", true, P_UNIQUE, V(), V(), nullptr, 0, 0 }
 
 static const Recipe kRecipes[] = {
     STR("SendPacket", "SendPacket(int type, std::string* text, ENetPeer* peer)", "Bad peer", true, P_UNIQUE, V(), V()),
@@ -28,7 +45,7 @@ static const Recipe kRecipes[] = {
     STR("VariantListSerializeFromMem", "VariantList::SerializeFromMem", "unknown var type", true, P_UNIQUE, V(), V()),
     STR("PacketTypeDispatcher", "NET_MESSAGE_* switch on received ENet packets", "Got unknown packet type: %d", true, P_UNIQUE, V(), V()),
     STR("PacketLengthValidator", "rejects packets with a bad length", "Bad packet length, ignoring", false, P_UNIQUE, V(), V()),
-    STR("TrackPacketSender", "analytics 'track' packet sender", "Un supported Tracking type: %d", true, P_UNIQUE, V(), V()),
+    STR("TrackPacketSender", "TrackHandlerComponent::HandleTrackPacket", "Un supported Tracking type: %d", true, P_UNIQUE, V(), V()),
     STR("ENetHostConnectSetup", "creates the ENet client host and connects", "No available peers for initiating an ENet connection", false, P_UNIQUE, V(), V()),
     STR("PlayerItems_AddItem", "", "PlayerItems::AddItem() nullptr == pItemInfo item", false, P_UNIQUE, V(), V()),
     STR("PlayerItems_HaveRoomForItem", "first of two overloads", "PlayerItems::HaveRoomForItem() can not be.", true, P_LOWEST, V(), V()),
@@ -86,12 +103,12 @@ static const Recipe kRecipes[] = {
     STR("Flying2Pets_OnRespawned", "", "Flying2PetsLogics::OnRespawned", true, P_UNIQUE, V(), V()),
     STR("FactionIconLoader", "", "Error loading Faction icons", true, P_UNIQUE, V(), V()),
     STR("PlayerProgression", "Ubisoft Connect event name builder (player.progression.*)", "player.progression.%s", true, P_UNIQUE, V(), V()),
-    STR("TextOverlayActionHandler", "msg|/file|/imageFile|/delayMS| overlay+audio handler", "imageFile|", true, P_UNIQUE, V(), V()),
+    STR("TextOverlayActionHandler", "GameLogicComponent::OnTextGameMessage (action|, msg|, file|, imageFile|, delayMS|)", "imageFile|", true, P_UNIQUE, V(), V()),
     STR("InventoryTabUI", "growid|/tabblocks|/tabseeds|/taball| inventory tabs", "tabblocks|", true, P_UNIQUE, V(), V()),
     STR("CaptchaInputDialog", "", "captcha_answer", true, P_UNIQUE, V(), V()),
     STR("AuthClient_Login", "AuthenticationClient::login (Ubisoft services)", "AuthenticationClient::login with PlayerCredentials", false, P_UNIQUE, V(), V()),
-    STR("WorldTileMap", "the tile-map container: dimensions + tile count", "WorldTileMap::Serialize() [fatal failed", false, P_UNIQUE, V(), V()),
-    STR("WorldTileMap", "the tile-map container: dimensions + tile count", "WorldTileMap: size: %d, %d", false, P_UNIQUE, V(), V()),
+    STR("WorldTileMap", "WorldTileMap::Serialize (this = the tile map inside World)", "WorldTileMap::Serialize() [fatal failed", false, P_UNIQUE, V(), V()),
+    STR("WorldTileMap", "WorldTileMap::Serialize (this = the tile map inside World)", "WorldTileMap: size: %d, %d", false, P_UNIQUE, V(), V()),
     STR("TileLookupGuard", "tile lookup / punch target resolution", "Error, no tile", true, P_UNIQUE, V(), V()),
     STR("TilesheetPageLoader", "tile sheet texture loader", "Error loading tiles_page2.rttex", true, P_UNIQUE, V(), V()),
     STR("WorldValidation", "world validation pass", "Validing World Now %s", true, P_UNIQUE, V(), V()),
@@ -134,13 +151,55 @@ static const Recipe kRecipes[] = {
     STR("OnVariantDispatcher", "main On* variant dispatcher", "OnClearAllTutorialArrows", true, P_UNIQUE, V(), V()),
     STR("PunchAction", "", "audio/punch_organic.wav", true, P_UNIQUE, V(), V()),
     STR("PunchAction", "", "Punch!", true, P_UNIQUE, V(), V()),
-    SPECIAL("GetApp", "", K_GETAPP),
+    SPECIAL("GetApp", "plain `return g_pApp` getter", K_GETAPP),
     SPECIAL("GetClient", "", K_GETCLIENT),
-    SPECIAL("GetPacketProcessor", "", K_GETPP),
+    SPECIAL("GetPacketProcessor", "GameLogicComponent accessor (GetGameLogic)", K_GETPP),
     SPECIAL("GetLocalAvatar", "", K_GETLA),
+
+    // ---- SDK entries used by the gt-internal (morphine) base ----
+    SPECIAL("GetBaseApp", "lazy-init GetApp (allocates App on first call); same object as GetApp", K_GETAPP_LAZY),
+    ALIAS("GetGameLogic", "GameLogicComponent accessor (= GetPacketProcessor)", "GetPacketProcessor"),
+    TAILACC("GetItemInfoManager", "ItemInfoManager* accessor via GetApp()", "kAppItemInfoManagerOffset"),
+    LARGEST("App_ctor", "App::App (largest callee of the lazy GetApp)", "GetBaseApp"),
+    VTABLE("App_Init", "App vtable slot 1", "App_ctor", 1, "App_Kill", 2),
+    VTABLE("App_Draw", "App vtable slot 3", "App_ctor", 3, "App_Kill", 2),
+    VTABLE("App_Update", "App::Update - App vtable slot 4 (Init=1, Kill=2, Draw=3, Update=4)", "App_ctor", 4, "App_Kill", 2),
+    CALLAFTER("LogMsg", "LogMsg(const char* fmt, ...) - the call right after the \"Bad peer\" string", "Bad peer", true, V(), V()),
+    CALLAFTER("LogToConsole", "in-game console log (`4...`` messages), variadic", "`4Error connecting!`` Timed out", false, V(), V()),
+    PATTERN("CreateTextLabelEntity", "CreateTextLabelEntity(Entity* parent, string name, float x, float y, string text)", "48 8B C4 48 89 58 ? 55 56 57 41 56 41 57 48 8D 68 ? 48 81 EC ? ? ? ? 0F 29 70 ? 0F 29 78 ? 48 8B 05 ? ? ? ? 48 33 C4 48 89 45 ? 0F 28 F3", true, P_UNIQUE),
+    STR("GameLogicComponent_DialogIsOpened", "true when any dialog/menu entity exists", "UbiclubMenuContainer", true, P_UNIQUE, V(), V()),
+    NTHCALL("GetEntityRoot", "Entity* GetEntityRoot() (first call of DialogIsOpened)", "GameLogicComponent_DialogIsOpened", 0),
+    NTHCALL("Entity_GetEntityByName", "Entity::GetEntityByName(const std::string&) (third call of DialogIsOpened)", "GameLogicComponent_DialogIsOpened", 2),
+    ALIAS("GameLogicComponent_OnTextGameMessage", "= TextOverlayActionHandler", "TextOverlayActionHandler"),
+    ALIAS("GameLogicComponent_ProcessTankUpdatePacket", "= ProcessTankUpdatePacket", "ProcessTankUpdatePacket"),
+    ALIAS("TrackHandlerComponent_HandleTrackPacket", "= TrackPacketSender", "TrackPacketSender"),
+    STR("LevelTouchComponent_OnTouch", "touch/click handler (parent of HandleTouchAtWorldCoordinates)", "action|wrench\n|netid|", true, P_UNIQUE, V("Can't touch yet"), V()),
+    LARGEST("LevelTouchComponent_HandleTouchAtWorldCoordinates", "largest callee of LevelTouchComponent_OnTouch", "LevelTouchComponent_OnTouch"),
+    PATTERN("NetAvatar_CanMessageT4", "NetAvatar::CanMessageT4 (message throttle)", "40 53 48 83 EC ? 48 8B D9 E8 ? ? ? ? 48 8B C8 E8 ? ? ? ? 8B C8 E8 ? ? ? ? 39 83 ? ? ? ? 76 ? 32 C0", true, P_UNIQUE),
+    PATTERN("WorldTileMap_Collide", "WorldTileMap::Collide", "E8 ? ? ? ? 48 85 C0 74 ? ? ? ? 48 8B CB E8 ? ? ? ? B0", false, P_UNIQUE),
+
+    // ---- struct offsets derived from code (not RVAs) ----
+    FIELD("AppClientOffset", "ENetClient* App::m_client (GetClient body)", "GetClient", 1, ""),
+    FIELD("AppGameLogicOffset", "GameLogicComponent* in App (GetGameLogic helper)", "GetPacketProcessor", 2, ""),
+    FIELD("AppItemInfoManagerOffset", "ItemInfoManager* in App (GetItemInfoManager helper)", "GetItemInfoManager", 2, ""),
+    FIELD("AppEntityRootOffset", "Entity* App::m_entityRoot (read by GetEntityRoot)", "GetEntityRoot", 1, ""),
+    FIELD("AppTrackHandlerOffset", "TrackHandlerComponent* in App (loaded after GetApp before HandleTrackPacket)", "TrackHandlerComponent_HandleTrackPacket", 5, ""),
+    FIELD("GameLogicLocalAvatarOffset", "NetAvatar* GameLogicComponent::m_localPlayer (GetLocalAvatar body)", "GetLocalAvatar", 2, ""),
+    FIELD("GameLogicWorldOffset", "World* in GameLogicComponent (most common `mov rcx,[rax+disp]` after GetGameLogic)", "GetPacketProcessor", 6, ""),
+    FIELD("WorldTileMapOffset", "WorldTileMap embedded in World (this passed to WorldTileMap::Serialize)", "WorldTileMap", 3, ""),
+    FIELD("ENetClientPeerOffset", "ENetPeer* in ENetClient (last `mov r8,[reg+disp]` before SendPacket calls)", "SendPacket", 7, ""),
+    FIELD("ItemInfoSize", "sizeof(ItemInfo): imul stride after GetItemInfoManager", "GetItemInfoManager", 4, ""),
 };
 
 #undef V
 #undef STR
 #undef CALLEE
+#undef CALLAFTER
+#undef PATTERN
+#undef LARGEST
+#undef NTHCALL
+#undef ALIAS
+#undef TAILACC
+#undef VTABLE
+#undef FIELD
 #undef SPECIAL
