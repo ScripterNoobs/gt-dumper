@@ -1,0 +1,146 @@
+// recipes.inl - one entry per offset, in output order.
+//
+//   STR(name, comment, anchor, exact, pick, V(also...), V(notalso...))
+//      -> the function whose code LEA-references `anchor`
+//         exact=true  : the referenced string must equal `anchor`
+//         exact=false : the referenced string must contain `anchor`
+//         pick        : P_UNIQUE (fail when ambiguous), P_LOWEST / P_HIGHEST (address),
+//                       P_SMALLEST / P_LARGEST (function size)
+//         also/notalso: further strings the function must / must not reference (V() = none)
+//   CALLEE(name, comment, parent, anchor) -> the function called by `parent` that references `anchor`
+//   SPECIAL(name, comment, kind)          -> pattern based accessors, see gtmapper.cpp
+//
+// Several entries may share a name: they are fallbacks, tried in order until one resolves
+// (the first entry's comment is used when none does). Output order = first occurrence.
+//
+// When a new build breaks a recipe, run with -v: the candidates are listed and a new
+// anchor / tie-break can be chosen from the strings the candidate functions reference.
+#define V(...) std::vector<const char*>{__VA_ARGS__}
+#define STR(name, comment, anchor, exact, pick, also, notalso) { name, comment, K_STR, anchor, exact, pick, also, notalso, nullptr }
+#define CALLEE(name, comment, parent, anchor) { name, comment, K_CALLEE, anchor, true, P_UNIQUE, V(), V(), parent }
+#define SPECIAL(name, comment, kind) { name, comment, kind, "", true, P_UNIQUE, V(), V(), nullptr }
+
+static const Recipe kRecipes[] = {
+    STR("SendPacket", "SendPacket(int type, std::string* text, ENetPeer* peer)", "Bad peer", true, P_UNIQUE, V(), V()),
+    STR("SendPacketRaw", "SendPacketRaw(int type, void* data, int len, ENetPeer* peer, int flags)", "Huge Packet Size %d", true, P_UNIQUE, V(), V()),
+    STR("ProcessTankUpdatePacket", "incoming PACKET_* dispatcher (also loads world data)", "ERROR: Wrong world version: %d, dataSize %d", true, P_UNIQUE, V(), V()),
+    STR("ProcessTankUpdatePacket", "incoming PACKET_* dispatcher (largest items.dat owner)", "items.dat", true, P_LARGEST, V(), V()),
+    STR("VariantListSerializeFromMem", "VariantList::SerializeFromMem", "unknown var type", true, P_UNIQUE, V(), V()),
+    STR("PacketTypeDispatcher", "NET_MESSAGE_* switch on received ENet packets", "Got unknown packet type: %d", true, P_UNIQUE, V(), V()),
+    STR("PacketLengthValidator", "rejects packets with a bad length", "Bad packet length, ignoring", false, P_UNIQUE, V(), V()),
+    STR("TrackPacketSender", "analytics 'track' packet sender", "Un supported Tracking type: %d", true, P_UNIQUE, V(), V()),
+    STR("ENetHostConnectSetup", "creates the ENet client host and connects", "No available peers for initiating an ENet connection", false, P_UNIQUE, V(), V()),
+    STR("PlayerItems_AddItem", "", "PlayerItems::AddItem() nullptr == pItemInfo item", false, P_UNIQUE, V(), V()),
+    STR("PlayerItems_HaveRoomForItem", "first of two overloads", "PlayerItems::HaveRoomForItem() can not be.", true, P_LOWEST, V(), V()),
+    STR("PlayerItems_RemoveItem", "", "Error, can't remove all %d", false, P_UNIQUE, V(), V()),
+    STR("InventoryIllegalItemPurge", "", "Illegal item %d in player inventory, skipping", true, P_UNIQUE, V(), V()),
+    STR("ItemsDatLoader", "", "Bad itemID %d in %s, skipping", false, P_UNIQUE, V(), V()),
+    STR("ItemValidator", "", "Found dice, removing", false, P_UNIQUE, V(), V()),
+    STR("ItemHashCheck", "", "Warning: No hash found for item %d", true, P_UNIQUE, V(), V()),
+    STR("ItemSurfaceRender", "", "ERROR: Surface for item %d not loaded!", true, P_UNIQUE, V(), V()),
+    STR("ChooseVisual", "", "ChooseVisual: ItemId not found: %d", true, P_UNIQUE, V(), V()),
+    STR("World_Load", "World::Load / LoadFromMem", "World::LoadFromMem() m_version", false, P_UNIQUE, V(), V()),
+    STR("WorldVersionCheck", "same function as ProcessTankUpdatePacket", "ERROR: Wrong world version: %d, dataSize %d", true, P_UNIQUE, V(), V()),
+    STR("WorldVersionCheck", "same function as ProcessTankUpdatePacket", "items.dat", true, P_LARGEST, V(), V()),
+    STR("TileExtraParser", "", "Bad type of %d detected in", false, P_UNIQUE, V(), V()),
+    STR("WhiteDoorLookup", "", "White door missing from map %s", true, P_UNIQUE, V(), V()),
+    STR("TilesheetLoader", "", "Can't load tilesheet %s... using temp tilesheet", false, P_UNIQUE, V(), V()),
+    STR("BgItemMapValidator", "", "Removing illegal bg item %d from map %s", true, P_UNIQUE, V(), V()),
+    STR("NetAvatar_OnAvatarBePaintBalled", "", "NetAvatar::OnAvatarBePaintBalled sourceNetID is", false, P_UNIQUE, V(), V()),
+    STR("PunchHackDetector", "", "Punch hack detected!", true, P_UNIQUE, V(), V()),
+    STR("PunchNoTileHandler", "huge world/tile interaction handler", "a punch was sent with no tile!", true, P_UNIQUE, V(), V()),
+    STR("HarvestInteraction", "", "You can harvest it by punching!", true, P_UNIQUE, V(), V()),
+    STR("CameraManager", "", "warning: No camera was active", true, P_UNIQUE, V(), V()),
+    STR("DialogBuilder", "add_label/add_image/... dialog parser", "Error with add_image parms", true, P_UNIQUE, V(), V()),
+    STR("BannerDialogBuilder", "add_banner/add_button dialog parser", "Error with add_big_banner parms", true, P_UNIQUE, V(), V()),
+    STR("EnableAllButtonsEntity", "", "EnableAllButtonsEntity() nullptr == pEnt", true, P_UNIQUE, V(), V()),
+    STR("Controller_PushController", "", "Controller::PushController", true, P_UNIQUE, V(), V()),
+    STR("Controller_PopController", "", "Controller::PopController", true, P_UNIQUE, V(), V()),
+    STR("Controller_PushChildController", "", "Controller::PushChildController", true, P_UNIQUE, V(), V()),
+    STR("Controller_OnActivate", "", "Controller::OnActivate", true, P_UNIQUE, V(), V()),
+    STR("Controller_Deactivate", "Controller::OnDeactivate", "Controller::OnDeactivate", true, P_UNIQUE, V(), V("UIController::OnDeactivate")),
+    STR("Controller_Release", "", "Controller::Release", true, P_UNIQUE, V(), V()),
+    STR("UIController_OnActivate", "", "UIController::OnActivate", true, P_UNIQUE, V(), V()),
+    STR("UIController_OnDeactivate", "", "UIController::OnDeactivate", true, P_UNIQUE, V(), V()),
+    STR("UIController_RemoveScreenView", "", "UIController::RemoveScreenView", true, P_UNIQUE, V(), V()),
+    STR("ParticleEmitter_GetPaintballColor", "", "ParticleEmitter::GetPaintballColor() un-defined", false, P_UNIQUE, V(), V()),
+    STR("RTFont_GetColorFromString", "", "RTFont::GetColorFromString> Bad code", true, P_UNIQUE, V(), V()),
+    STR("ResourceManager_GetSurfaceResource", "first of two overloads", "ResourceManager::GetSurfaceResource: Unable to l", false, P_LOWEST, V(), V()),
+    STR("VideoModeManager_SetVideoMode", "first of two overloads", "VideoModeManager::SetVideoMode", true, P_LOWEST, V(), V()),
+    STR("VideoModeManager_SetFullscreen", "SetFullscreenVideoMode, first of three overloads", "VideoModeManager::SetFullscreenVideoMode", true, P_LOWEST, V(), V()),
+    STR("VideoModeManager_AddVideoMode", "the real AddVideoMode (the init function inlines a copy)", "VideoModeManager::AddVideoMode", true, P_LOWEST, V(), V()),
+    STR("VideoModeManager_GetCustomVideoModes", "", "VideoModeManager::GetCustomVideoModes", true, P_UNIQUE, V(), V()),
+    STR("VideoModeManager_OnWMSize", "", "VideoModeManager::OnWMSize", true, P_UNIQUE, V(), V()),
+    STR("IAPManager_LoadCurrenciesConfig", "", "IAPManager::LoadCurrenciesConfig() text.empty", false, P_UNIQUE, V(), V()),
+    STR("IAPManager_ctor", "", "IAPManager::IAPManager() iapText.empty", false, P_UNIQUE, V(), V()),
+    STR("App_Kill", "", "Don't call App::Kill() again.", true, P_UNIQUE, V(), V()),
+    STR("StoreBuyPacketPath", "store purchase confirm / buy packet", "video credits to purchase", false, P_UNIQUE, V(), V()),
+    STR("TileCoordinateHandler", "", "tileX == %d, tileY == %d", true, P_UNIQUE, V(), V()),
+    STR("LogDisplayEntityBuilder", "NOT LogToConsole: builds the LogDisplayEntity, also refs GenericDialog", "LogDisplayEntity", true, P_UNIQUE, V("GenericDialog"), V()),
+    STR("ItemRendererXmlLoader", "parses GameData/ItemRenderers/*.xml (ItemRenderer/Data/*)", "ItemRenderer/Data/StateMachines/*", true, P_UNIQUE, V(), V()),
+    STR("BattlePetConfigLoader", "", "Can't load BattlePet info config: %s, error: %s, off", false, P_UNIQUE, V(), V()),
+    STR("OwlsOfAthenaPets_RenderPet", "", "OwlsOfAthenaPetsLogics::RenderPet", true, P_UNIQUE, V(), V()),
+    STR("Flying2Pets_RenderPet", "", "Flying2PetsLogics::RenderPet", true, P_UNIQUE, V(), V()),
+    STR("Scepter_RenderPet", "", "ScepterOfTheHonorGuardLogics::RenderPet", true, P_UNIQUE, V(), V()),
+    STR("OwlsOfAthenaPets_OnRespawned", "", "OwlsOfAthenaPetsLogics::OnRespawned", true, P_UNIQUE, V(), V()),
+    STR("Flying2Pets_OnRespawned", "", "Flying2PetsLogics::OnRespawned", true, P_UNIQUE, V(), V()),
+    STR("FactionIconLoader", "", "Error loading Faction icons", true, P_UNIQUE, V(), V()),
+    STR("PlayerProgression", "Ubisoft Connect event name builder (player.progression.*)", "player.progression.%s", true, P_UNIQUE, V(), V()),
+    STR("TextOverlayActionHandler", "msg|/file|/imageFile|/delayMS| overlay+audio handler", "imageFile|", true, P_UNIQUE, V(), V()),
+    STR("InventoryTabUI", "growid|/tabblocks|/tabseeds|/taball| inventory tabs", "tabblocks|", true, P_UNIQUE, V(), V()),
+    STR("CaptchaInputDialog", "", "captcha_answer", true, P_UNIQUE, V(), V()),
+    STR("AuthClient_Login", "AuthenticationClient::login (Ubisoft services)", "AuthenticationClient::login with PlayerCredentials", false, P_UNIQUE, V(), V()),
+    STR("WorldTileMap", "the tile-map container: dimensions + tile count", "WorldTileMap::Serialize() [fatal failed", false, P_UNIQUE, V(), V()),
+    STR("WorldTileMap", "the tile-map container: dimensions + tile count", "WorldTileMap: size: %d, %d", false, P_UNIQUE, V(), V()),
+    STR("TileLookupGuard", "tile lookup / punch target resolution", "Error, no tile", true, P_UNIQUE, V(), V()),
+    STR("TilesheetPageLoader", "tile sheet texture loader", "Error loading tiles_page2.rttex", true, P_UNIQUE, V(), V()),
+    STR("WorldValidation", "world validation pass", "Validing World Now %s", true, P_UNIQUE, V(), V()),
+    STR("WeaponDamageTierText", "weapon damage tier description", "Increases the damage of all Tier 1 Weapons.", false, P_UNIQUE, V(), V()),
+    STR("GrowtorialButton", "", "add_commnty_growtorial_bttn", true, P_UNIQUE, V(), V()),
+    STR("WorldLockText", "", " per World Lock", true, P_UNIQUE, V(), V()),
+    STR("SeedTreeItemPath", "", "itemIDseed2tree_itemAmount", true, P_UNIQUE, V(), V()),
+    STR("TileDefinitionsLoader", "", "Error getting tile definit", false, P_UNIQUE, V(), V()),
+    STR("WeatherEffectText", "", "`5Weather Effect``. ", true, P_UNIQUE, V(), V()),
+    STR("ItemEffectVariantDispatcher", "second On* dispatcher: item/cosmetic effect variants", "OnSuperSupportState", true, P_UNIQUE, V(), V()),
+    STR("OnDeathEquipTagHandler", "also OnEquipTag; death + equip-tag handling", "OnEquipTag", true, P_UNIQUE, V(), V()),
+    STR("OnDisconnectedHandler", "", "Chat Tab -- Removing OnDisconnected", true, P_UNIQUE, V(), V()),
+    STR("OnErrorFinishHandler", "also OnFinish", "OnFinish", true, P_UNIQUE, V(), V()),
+    STR("OnOverMoveHandler", "also OnOverEnd; hover/drag move", "OnOverMove", true, P_UNIQUE, V("checkMoveDistanceBeforeRelease"), V()),
+    STR("OnOverMoveHandler", "also OnOverEnd; hover/drag move", "OnOverMove", true, P_UNIQUE, V(), V()),
+    STR("OnEventHandler", "", "OnEvent", true, P_UNIQUE, V(), V()),
+    STR("OnRenderHandler", "the OnRender owner that also refs effectPower", "OnRender", true, P_UNIQUE, V("effectPower"), V()),
+    STR("OnFakeScrollToEntity", "", "OnFakeScrollToEntity", true, P_UNIQUE, V(), V()),
+    STR("OnDeleteHandler", "Ubisoft SDK config parser (waitRemoteLogCompletionOnDeleteSession)", "waitRemoteLogCompletionOnDeleteSession", true, P_UNIQUE, V(), V()),
+    STR("OnButtonSelectedHandler", "the OnButtonSelected owner that also refs middle_colour", "OnButtonSelected", true, P_UNIQUE, V("middle_colour"), V()),
+    STR("TradeHandler", "", "CancelTrade", true, P_UNIQUE, V(), V()),
+    STR("TradeHandler", "", "Trade canceled", true, P_UNIQUE, V(), V()),
+    STR("TradeOtherPlayerGuard", "", "other player doesn't exist", false, P_UNIQUE, V(), V()),
+    STR("StateMachineTransitions", "item-renderer state-machine transitions", "./Transitions", true, P_UNIQUE, V(), V()),
+    STR("AnimCurveKeyFrameParser", "animation curve/keyframe parser (first instantiation)", "./KeyFrame", true, P_LOWEST, V("animTime", "./Curve"), V("sprite")),
+    STR("SpriteAnimStateParser", "sprite animation: playOnState/isLoop", "playOnState", true, P_UNIQUE, V(), V()),
+    STR("AnimTimeParser", "first instantiation", "targetVariableName", true, P_LOWEST, V(), V("offsetVariableName")),
+    STR("ParticleEmitterParser", "particle emitter definitions (same as GetPaintballColor)", "ParticleEmitter::GetPaintballColor() un-defined", false, P_UNIQUE, V(), V()),
+    CALLEE("RendererConditionParser", "state-machine <Condition> evaluation", "StateMachineTransitions", "Condition"),
+    STR("SpriteRenderParser", "last DefaultReplacementSpriteRenderObject instantiation", "DefaultReplacementSpriteRenderObject::RenderBehind()", false, P_HIGHEST, V(), V()),
+    STR("LoginPacketBuilder", "builds tankIDName|/requestedName|/game_version| login text", "tankIDName|", true, P_UNIQUE, V(), V()),
+    STR("TileActionBuilder", "", "tileY|", true, P_UNIQUE, V(), V()),
+    STR("DialogButtonBuilder", "", "button|", true, P_UNIQUE, V(" `9#"), V()),
+    STR("DialogButtonBuilder", "", "button|", true, P_UNIQUE, V(), V()),
+    STR("NetAvatarSpawnHandler", "", "World doesn't exit, not spawning", true, P_UNIQUE, V(), V()),
+    STR("GameUpdatePacketSerializer", "GameUpdatePacket -> text dump", "GameUpdatePacket data: ", false, P_UNIQUE, V(), V()),
+    STR("NetAvatarNetIDEmitter", "", "pId|", true, P_UNIQUE, V(), V()),
+    STR("NetAvatarNetIDEmitter", "smallest netID| owner", "netID|", true, P_SMALLEST, V(), V()),
+    STR("IAPPurchaseValidation", "", "action|houston_validation_done", true, P_UNIQUE, V(), V()),
+    STR("OnVariantDispatcher", "main On* variant dispatcher", "OnClearAllTutorialArrows", true, P_UNIQUE, V(), V()),
+    STR("PunchAction", "", "audio/punch_organic.wav", true, P_UNIQUE, V(), V()),
+    STR("PunchAction", "", "Punch!", true, P_UNIQUE, V(), V()),
+    SPECIAL("GetApp", "", K_GETAPP),
+    SPECIAL("GetClient", "", K_GETCLIENT),
+    SPECIAL("GetPacketProcessor", "", K_GETPP),
+    SPECIAL("GetLocalAvatar", "", K_GETLA),
+};
+
+#undef V
+#undef STR
+#undef CALLEE
+#undef SPECIAL

@@ -1,0 +1,17 @@
+# build output
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# generated offsets (outputs, not source)
+offsets.h
+offsets.cs
+
+# analysis scratch
+*.pkl
+
+# release staging
+dist/
